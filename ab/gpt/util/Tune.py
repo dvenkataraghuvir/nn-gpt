@@ -301,9 +301,9 @@ def nn_gen(
             batch_prompts = [item[1] for item in batch]
 
             if prompt_batch > 1 and hasattr(chat_bot, 'chat_batch'):
-                batch_outputs = chat_bot.chat_batch(batch_prompts, engineer_prompt=False, max_new_tokens=max_new_tokens)
+                batch_outputs = chat_bot.chat_batch(batch_prompts, max_new_tokens=max_new_tokens)
             else:
-                batch_outputs = [chat_bot.chat(p, engineer_prompt=False, max_new_tokens=max_new_tokens) for p in batch_prompts]
+                batch_outputs = [chat_bot.chat(p, max_new_tokens=max_new_tokens) for p in batch_prompts]
 
             for (idx, prompt_text, origdf), output in zip(batch, batch_outputs):
                 model_dir = models_dir / f"B{idx}"
@@ -407,7 +407,7 @@ def trans_gen(epoch, out_path, chat_bot, conf_keys, nn_train_epochs, prompt_dict
         model_dir = models_dir / f'B{idx}'
         prompt_text, origdf = prompt_data
 
-        code, hp, tr, full_out = chat_bot.chat(prompt_text, engineer_prompt=False, max_new_tokens=max_new_tokens)
+        code, hp, tr, full_out = chat_bot.chat(prompt_text, max_new_tokens=max_new_tokens)
 
         makedirs(model_dir, exist_ok=True)
         if save_llm_output:

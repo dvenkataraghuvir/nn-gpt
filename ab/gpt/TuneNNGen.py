@@ -286,17 +286,22 @@ unsloth_opt={unsloth_opt}, trans_mode={trans_mode}, prompt_batch={prompt_batch},
 
     # Create TrainingArguments with all parameters at once
     training_args = TrainingArguments(**training_kwargs)
+
+    # layers_to_transform must be None when targeting top-level modules like lm_head
+    # (lm_head is not inside a transformer layer, so layer indices don't apply)
+    layers = None if tune_layers is None else list(tune_layers)
+
     peft_config = LoraConfig(
         r=r,
         lora_alpha=lora_alpha,
         target_modules=target_modules,
-        layers_to_transform=list(tune_layers),
+        layers_to_transform=layers,
         lora_dropout=lora_dropout,
         bias=bias,
         task_type=task_type)
 
     print(f"[LoRA Config] target_modules={target_modules}")
-    print(f"[LoRA Config] layers_to_transform={list(tune_layers)}")
+    print(f"[LoRA Config] layers_to_transform={layers}")
     print(f"[LoRA Config] r={r}, lora_alpha={lora_alpha}, lora_dropout={lora_dropout}")
 
     try:
@@ -512,6 +517,13 @@ if __name__ == '__main__':
                         help="[Pipeline] Weight decay (default: None).")
     parser.add_argument('--trans_mode', action='store_true',
                         help=f"Transform mode only (default: {TRANS_MODE}).")
+    # Header-only fine-tuning flag
+    parser.add_argument('--tune_headers_only', action='store_true', default=False,
+                        help=f"Enable header-only fine-tuning mode (lm_head layer only). Reduces training time and memory.")
+    parser.add_argument('--header_lora_rank', type=int, default=None,
+                        help=f"LoRA rank for header-only training (default: auto-adjusted based on mode)")
+    parser.add_argument('--header_max_tokens', type=int, default=8192,
+                        help=f"Max output tokens for header training (default: 8192, smaller than full training)")
     parser.add_argument('--onnx_run', action='store_true',
                         help=f"ONNX format (default: {ONNX_RUN}).")
     parser.add_argument('--unsloth_opt', action='store_true',
@@ -526,8 +538,144 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # Convert start_layer/end_layer → tune_layers (main() expects a range, not two ints)
-    kwargs = vars(args)
-    kwargs['tune_layers'] = range(kwargs.pop('start_layer'), kwargs.pop('end_layer'))
+    # Header-only fine-tuning mode: target lm_head only via existing main()
+    if args.tune_headers_only:
+        header_lora_rank = args.header_lora_rank if args.header_lora_rank else 16
+        main(
+            num_train_epochs=args.num_train_epochs if args.num_train_epochs != NUM_TRAIN_EPOCHS else 2,
+            lr_scheduler=args.lr_scheduler,
+            max_grad_norm=args.max_grad_norm,
+            tune_layers=None,  # None = no layers_to_transform; lm_head is top-level, not inside a layer
+            r=header_lora_rank,
+            lora_alpha=header_lora_rank,
+            lora_dropout=args.lora_dropout,
+            target_modules=('lm_head',),
+            task_type=args.task_type,
+            bias=args.bias,
+            learning_rate=args.learning_rate if args.learning_rate != LEARNING_RATE else 5e-6,
+            llm_tune_conf=args.llm_tune_conf,
+            nn_gen_conf=args.nn_gen_conf,
+            nn_gen_conf_id=args.nn_gen_conf_id,
+            llm_conf=args.llm_conf,
+            test_nn=args.test_nn if args.test_nn != TEST_NN else 5,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps if args.gradient_accumulation_steps != GRADIENT_ACCUMULATION_STEPS else 4,
+            warmup_ratio=args.warmup_ratio,
+            logging_steps=args.logging_steps if args.logging_steps != LOGGING_STEPS else 48,
+            optimizer=args.optimizer,
+            peft=args.peft,
+            skip_epoches=args.skip_epoches,
+            max_prompts=args.max_prompts if args.max_prompts != MAX_PROMPTS else 2 * 1024,
+            max_new_tokens=args.header_max_tokens,
+            use_deepspeed=args.use_deepspeed,
+            save_llm_output=args.save_llm_output,
+            nn_name_prefix=args.nn_name_prefix if args.nn_name_prefix else 'header',
+            nn_train_epochs=args.nn_train_epochs,
+            temperature=args.temperature if args.temperature != TEMPERATURE else 0.7,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            test_metric=args.test_metric,
+            data_dir=args.data_dir,
+            evaluation_strategy=args.evaluation_strategy,
+            eval_steps=args.eval_steps,
+            per_device_eval_batch_size=args.per_device_eval_batch_size,
+            save_strategy=args.save_strategy,
+            save_steps=args.save_steps,
+            save_total_limit=args.save_total_limit,
+            load_best_model_at_end=args.load_best_model_at_end,
+            metric_for_best_model=args.metric_for_best_model,
+            warmup_steps=args.warmup_steps,
+            weight_decay=args.weight_decay,
+            onnx_run=args.onnx_run,
+        )
+        sys.exit(0)
 
-    main(**kwargs)
+    # Check if iterative pipeline mode is requested
+    if args.run_iterative_pipeline:
+        # Validate required arguments for pipeline mode
+        if args.base_data_dir is None:
+            parser.error("--base_data_dir is required when --run_iterative_pipeline is set")
+        if args.llm_conf is None:
+            parser.error("--llm_conf is required when --run_iterative_pipeline is set")
+        
+        # Validate resume cycle if provided
+        if args.resume_from_cycle is not None:
+            if args.resume_from_cycle < 1 or args.resume_from_cycle > args.cycles:
+                parser.error(f"--resume_from_cycle must be between 1 and {args.cycles}, got {args.resume_from_cycle}")
+        
+        # Import and run iterative pipeline
+        from ab.gpt.iterative_finetune import IterativeFinetuner
+        
+        pipeline = IterativeFinetuner(
+            base_data_dir=args.base_data_dir,
+            output_dir=args.output_dir,
+            llm_conf=args.llm_conf,
+            cycles=args.cycles,
+            models_per_cycle=args.models_per_cycle,
+            samples_per_prompt=args.samples_per_prompt,
+            accuracy_threshold=args.accuracy_threshold,
+            min_selected_k=args.min_selected_k,
+            fallback_threshold=args.fallback_threshold,
+            adaptive_threshold=args.adaptive_threshold,
+            novelty_check=args.novelty_check,
+            resume_from_cycle=args.resume_from_cycle,
+            max_retries=args.max_retries,
+            use_optimized_training=args.use_optimized_training,
+            num_train_epochs=args.num_train_epochs,  # Pipeline-specific epochs override
+        )
+        
+        # Run the pipeline
+        pipeline.run()
+        # Exit early, don't run standalone fine-tuning
+        sys.exit(0)
+    
+    # Standalone fine-tuning mode (default behavior)
+    main(num_train_epochs=args.num_train_epochs,
+         lr_scheduler=args.lr_scheduler,
+         max_grad_norm=args.max_grad_norm,
+         tune_layers=range(args.start_layer, args.end_layer),
+         r=args.r,
+         lora_alpha=args.lora_alpha,
+         lora_dropout=args.lora_dropout,
+         task_type=args.task_type,
+         bias=args.bias,
+         target_modules=args.target_modules,
+         learning_rate=args.learning_rate,
+         llm_tune_conf=args.llm_tune_conf,
+         nn_gen_conf=args.nn_gen_conf,
+         nn_gen_conf_id=args.nn_gen_conf_id,
+         llm_conf=args.llm_conf,
+         test_nn=args.test_nn,
+         per_device_train_batch_size=args.per_device_train_batch_size,
+         gradient_accumulation_steps=args.gradient_accumulation_steps,
+         warmup_ratio=args.warmup_ratio,
+         logging_steps=args.logging_steps,
+         optimizer=args.optimizer,
+         peft=args.peft,
+         skip_epoches=args.skip_epoches,
+         max_prompts=args.max_prompts,
+         max_new_tokens=args.max_new_tokens,
+         use_deepspeed=args.use_deepspeed,
+         save_llm_output=args.save_llm_output,
+         nn_name_prefix=args.nn_name_prefix,
+         nn_train_epochs=args.nn_train_epochs,
+         temperature=args.temperature,
+         top_k=args.top_k,
+         top_p=args.top_p,
+         test_metric=args.test_metric,
+         data_dir=args.data_dir,
+         # Pipeline overrides (optional)
+         evaluation_strategy=args.evaluation_strategy,
+         eval_steps=args.eval_steps,
+         per_device_eval_batch_size=args.per_device_eval_batch_size,
+         save_strategy=args.save_strategy,
+         save_steps=args.save_steps,
+         save_total_limit=args.save_total_limit,
+         load_best_model_at_end=args.load_best_model_at_end,
+         metric_for_best_model=args.metric_for_best_model,
+         warmup_steps=args.warmup_steps,
+         weight_decay=args.weight_decay,
+         onnx_run=args.onnx_run,
+         unsloth_opt = args.unsloth_opt,
+         prompt_batch = args.prompt_batch,
+    )

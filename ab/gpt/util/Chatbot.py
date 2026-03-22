@@ -1,20 +1,39 @@
 # ab/gpt/util/Chatbot.py
 
-from transformers import PreTrainedTokenizer, PreTrainedModel, pipeline
-from ab.gpt.util.Util import extract_code, extract_hyperparam, extract_transform, extract_all_to_train
+import re
+
 import torch
+from transformers import PreTrainedTokenizer, PreTrainedModel, StoppingCriteria, StoppingCriteriaList, pipeline
 
-extra_instructions = (
-    " Use PyTorch for the implementation. Keep the code short. Name the main class of the model \"Net\"."
-    " The model code must include default parameters for initialization in the constructor. "
-    "Provide only the code. Don't provide any explanation. Remove any text from this reply. "
-    "Don't include comments in the code."
-)
+from ab.gpt.util.Util import extract_code, extract_hyperparam, extract_transform, extract_all_to_train
 
-example_prompt = (
-    "Write PyTorch code for an efficient classification model that includes self-attention blocks."
-    + extra_instructions
-)
+
+class XMLCompletionCriteria(StoppingCriteria):
+    """Stop generation at the token level the moment </nn> is fully emitted.
+
+    Since <nn> is always the last required tag, any tokens after </nn> are
+    waste. Stopping here saves compute and keeps full_output.txt clean.
+    """
+
+    def __init__(self, tokenizer):
+        ids = tokenizer.encode('</nn>', add_special_tokens=False)
+        self.stop_ids = ids
+        self.stop_len = len(ids)
+
+    def __call__(self, input_ids: torch.LongTensor, scores, **kwargs) -> bool:
+        if input_ids.shape[-1] < self.stop_len:
+            return False
+        return input_ids[0, -self.stop_len:].tolist() == self.stop_ids
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks from model output before saving.
+
+    OlympicCoder-7B (open-r1 lineage) wraps chain-of-thought in <think> tags.
+    The reasoning helps generation quality but inflates full_output.txt and
+    pollutes size measurements. Strip it here, keep <hp>, <tr>, <nn> intact.
+    """
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
 def _extract_generated_content(item):
     """Normalize HF pipeline outputs across single/batch return shapes."""
@@ -168,20 +187,16 @@ class ChatBot:
             results.append((nn, extract_hyperparam(generated), extract_transform(generated), generated))
         return results
 
-    def chat(self, prompt: str, max_len=None, max_new_tokens=None, engineer_prompt=True) -> tuple[str, str, str, str]:
-        # Set model to eval mode (no-op for ONNX)
+    def chat(self, prompt: str, max_len=None, max_new_tokens=None) -> tuple[str, str, str, str]:
         if hasattr(self.model, "eval"):
             self.model.eval()
-        
-        if engineer_prompt:
-            prompt += extra_instructions
-        
+
         if self.__keep_memory:
             self.__messages.append({"role": "user", "content": prompt})
             in_next = self.__messages
         else:
             in_next = [{"role": "user", "content": prompt}]
-        
+
         # Use pipeline if available (PyTorch path)
         if self.__pipeline is not None:
             try:
@@ -203,9 +218,12 @@ class ChatBot:
                 except TypeError:
                     out_item = self.__pipeline(in_next, **generation_kwargs)[0]
                     out = _extract_generated_content(out_item)
-                
+
                 assert isinstance(out, str)
-                
+
+                out = _strip_thinking(out)
+                out = self._close_unclosed_tags(out)
+
                 if self.__keep_memory:
                     self.__messages.append({"role": "assistant", "content": out})
 
@@ -218,23 +236,22 @@ class ChatBot:
         # Direct generation (ONNX or PyTorch fallback)
         return self._direct_generate(in_next, max_new_tokens, max_len)
 
-    def chat_batch(self, prompts, max_len=None, max_new_tokens=None, engineer_prompt=True):
+    def chat_batch(self, prompts, max_len=None, max_new_tokens=None):
         """Batch generation for multiple prompts; falls back to per-prompt generation."""
         if not prompts:
             return []
 
         if self.__keep_memory:
-            return [self.chat(p, max_len=max_len, max_new_tokens=max_new_tokens, engineer_prompt=engineer_prompt) for p in prompts]
+            return [self.chat(p, max_len=max_len, max_new_tokens=max_new_tokens) for p in prompts]
 
-        prepared_prompts = [p + extra_instructions if engineer_prompt else p for p in prompts]
         if self.__pipeline is not None or not self.is_onnx:
             try:
-                return self._direct_generate_batch(prepared_prompts, max_new_tokens=max_new_tokens, max_len=max_len)
+                return self._direct_generate_batch(prompts, max_new_tokens=max_new_tokens, max_len=max_len)
             except Exception as e:
                 print(f"[WARN] Direct batch generation failed: {e}")
                 print("[INFO] Falling back to per-prompt generation")
 
-        return [self.chat(p, max_len=max_len, max_new_tokens=max_new_tokens, engineer_prompt=engineer_prompt) for p in prompts]
+        return [self.chat(p, max_len=max_len, max_new_tokens=max_new_tokens) for p in prompts]
 
     def _direct_generate(self, messages, max_new_tokens, max_len):
         """Direct model.generate() call without pipeline - works for ONNX and PyTorch"""
@@ -300,7 +317,9 @@ class ChatBot:
             # FIX: Store input length before generation
             input_length = inputs['input_ids'].shape[-1]  # Use shape[-1] for sequence length
             
-            # Generate
+            # Stop generation the moment </nn> is emitted — zero wasted compute
+            stopping_criteria = StoppingCriteriaList([XMLCompletionCriteria(self.tokenizer)])
+
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
@@ -312,14 +331,17 @@ class ChatBot:
                     top_p=self.top_p,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
+                    stopping_criteria=stopping_criteria,
                 )
-            
-            # FIX: Decode only the generated part (skip input prompt)
-            generated_ids = outputs[0][input_length:]  # Use input_length, not shape[1]
+
+            generated_ids = outputs[0][input_length:]
             out = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-            
+
             assert isinstance(out, str)
-            
+
+            out = _strip_thinking(out)
+            out = self._close_unclosed_tags(out)
+
             if self.__keep_memory:
                 self.__messages.append({"role": "assistant", "content": out})
             
@@ -330,3 +352,34 @@ class ChatBot:
             import traceback
             traceback.print_exc()
             return None, None, None, ""
+
+    def _close_unclosed_tags(self, text: str) -> str:
+        """
+        Close any unclosed XML-like tags in the output.
+        
+        This ensures that truncated output has complete tag structure:
+        - </nn> for <nn>...</nn> blocks
+        - </hp> for <hp>...</hp> blocks  
+        - </tr> for <tr>...</tr> blocks
+        
+        Args:
+            text: Text potentially with unclosed tags
+            
+        Returns:
+            Text with all tags properly closed
+        """
+        # List of tags to check and close
+        tags_to_close = [('</nn>', '<nn>'), ('</hp>', '<hp>'), ('</tr>', '<tr>')]
+        
+        for closing_tag, opening_tag in tags_to_close:
+            open_count = text.count(opening_tag)
+            close_count = text.count(closing_tag)
+            
+            # If we have more opening tags than closing tags, add closing tags
+            if open_count > close_count:
+                missing_closes = open_count - close_count
+                print(f"[INFO] Adding {missing_closes} missing {closing_tag} tags")
+                text = text + (closing_tag + '\n') * missing_closes
+        
+        return text
+
