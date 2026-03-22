@@ -166,6 +166,8 @@ class ChatBot:
         else:
             input_lengths = [inputs['input_ids'].shape[1]] * inputs['input_ids'].shape[0]
 
+        stopping_criteria = StoppingCriteriaList([XMLCompletionCriteria(self.tokenizer)])
+
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
@@ -177,12 +179,15 @@ class ChatBot:
                 top_p=self.top_p,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
+                stopping_criteria=stopping_criteria,
             )
 
         results = []
         for i in range(outputs.shape[0]):
             generated_ids = outputs[i][int(input_lengths[i]):]
             generated = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            generated = _strip_thinking(generated)
+            generated = self._close_unclosed_tags(generated)
             nn = extract_code(generated)
             results.append((nn, extract_hyperparam(generated), extract_transform(generated), generated))
         return results
